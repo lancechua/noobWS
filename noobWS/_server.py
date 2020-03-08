@@ -85,6 +85,7 @@ class NoobServer:
         self.loop = None
         self.msg_queue = None
         self.ws = None
+        self.connected = False
 
     async def listener(self):
         """
@@ -118,6 +119,8 @@ class NoobServer:
             if msg == self.kill_signal:
                 logging.info("[socket] LISTENER received KILL signal")
                 break
+            elif msg == b"ping":
+                await self.msg_queue.put([socket_name, b"pong"])
             else:
                 # formatter here
                 fmt_msg = self.in_formatter(msg, socket_name)
@@ -141,7 +144,7 @@ class NoobServer:
         await self.shutdown(False)
 
     async def data_feed(
-        self, ws: websockets.WebSocketClientProtocol, socket_name: bytes = ""
+        self, ws: websockets.WebSocketClientProtocol, socket_name: bytes = b""
     ):
         """
         Websocket Coroutine
@@ -160,9 +163,20 @@ class NoobServer:
             `[socket_name: bytes, message: bytes]`
         """
         log_prefix = "{}| ".format(socket_name) if socket_name else ""
-        async for msg in ws:
-            logging.debug("[client] %sReceived %s", log_prefix, msg)
-            await self.msg_queue.put([socket_name, msg])
+        error_caught = False
+        try:
+            async for msg in ws:
+                logging.debug("[client] %sReceived %s", log_prefix, msg)
+                await self.msg_queue.put([socket_name, msg])
+        except websockets.ConnectionClosedError:
+            logging.error("websocket closed unexpectedly %s", ws.remote_address)
+            error_caught = True
+        except Exception:
+            logging.error("websocket error: %s", repr(Exception))
+            error_caught = True
+        finally:
+            if error_caught:
+                await self.shutdown(True)
 
     async def publisher(self):
         """
@@ -178,7 +192,7 @@ class NoobServer:
         while True:
             socket_name, msg = await self.msg_queue.get()
             topic, fmt_msg = self.out_formatter(msg, socket_name)
-            logging.info("[socket] PUBLISHER sending %s|%s", topic, fmt_msg)
+            logging.debug("[socket] PUBLISHER sending %s|%s", topic, fmt_msg)
             await broadcaster.send_multipart([topic, fmt_msg])
 
             if msg == self.kill_signal:
@@ -202,11 +216,21 @@ class NoobServer:
         await self.msg_queue.put([self.name, self.kill_signal])
 
         # close sockets
-        for ws in self.ws.values():
-            await ws.close()
+        logging.info("Closing socket(s). This might take ~10 seconds...")
+        await asyncio.gather(*[ws.close() for ws in self.ws.values()])
 
-    def run(self):
-        """Method to start Socket. Blocking"""
+        self.connected = False
+
+    def run(self, addl_coros: list = None):
+        """Method to start Socket. Blocking
+
+        Parameters
+        ----------
+        addl_coros: list
+            additional coroutines / tasks to run
+        """
+
+        addl_coros = addl_coros or []
 
         logging.info("[socket] Starting")
         self.loop = asyncio.new_event_loop()
@@ -217,12 +241,15 @@ class NoobServer:
             key: self.loop.run_until_complete(websockets.connect(uri))
             for key, uri in self.uri.items()
         }
-        coros = [self.listener(), self.publisher()] + [
-            self.data_feed(ws, key) for key, ws in self.ws.items()
-        ]
+        coros = (
+            [self.listener(), self.publisher()]
+            + [self.data_feed(ws, key) for key, ws in self.ws.items()]
+            + addl_coros
+        )
 
         logging.info("[socket] starting tasks")
         try:
+            self.connected = True
             self.loop.run_until_complete(asyncio.gather(*coros))
         except KeyboardInterrupt:
             logging.warning("[socket] KeyboardInterrupt caught!")
@@ -232,6 +259,10 @@ class NoobServer:
             self.loop.close()
 
         logging.info("[socket] Closed.")
+
+    def restart(self, addl_coros: list = None):
+        self.loop.run_until_complete(self.shutdown(True))
+        self.run(addl_coros=addl_coros)
 
     def in_formatter(self, msg: bytes, socket_name: bytes = b""):
         """Formatter for incoming messages

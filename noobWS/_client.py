@@ -75,6 +75,7 @@ class MultiClient:
         self.topics = topics or [b""]
         self.timeout = timeout
 
+        self.running = False
         self.shutdown_event = threading.Event()
         self.threads = {}
 
@@ -94,6 +95,9 @@ class MultiClient:
     def __send__(self, server_name: str, ns_socket: bytes, msg: bytes):
         """Internal method to send message"""
 
+        if isinstance(server_name, bytes):
+            server_name = server_name.decode()
+
         if isinstance(msg, str):
             msg = msg.encode()
 
@@ -101,6 +105,9 @@ class MultiClient:
             ns_socket = ns_socket.encode()
 
         self.cmd_queue.put([server_name, ns_socket, msg])
+
+    def ping(self, server_name: str, ns_socket: bytes = b""):
+        self.send(server_name, b"ping", ns_socket=ns_socket)
 
     def recv(self, timeout: float = None):
         """Receive message to socket"""
@@ -141,11 +148,13 @@ class MultiClient:
             thread.start()
 
         logging.info("[client] Ready")
+        self.running = True
 
     def stop(self):
         """Stop client"""
         logging.info(
-            "[client] Initiating shutdown. Please wait for ~%.1f second(s)...", self.timeout
+            "[client] Initiating shutdown. Please wait for ~%.1f second(s)...",
+            self.timeout,
         )
         self.shutdown_event.set()
         for thread in self.threads.values():
@@ -153,6 +162,7 @@ class MultiClient:
 
         self.ctx.term()
         logging.info("[client] shutdown complete")
+        self.running = False
 
     def _subscriber_thread(self, address, topics, ns_socket: str = ""):
         subscriber = self.ctx.socket(self.pub_stype)
@@ -165,12 +175,14 @@ class MultiClient:
         subscriber.connect(address)
 
         logging.info(
-            "[client] Subscribing to %s%s", "{}@".format(ns_socket) if ns_socket else "", address
+            "[client] Subscribing to %s%s",
+            "{}@".format(ns_socket) if ns_socket else "",
+            address,
         )
         while not self.shutdown_event.is_set():
             try:
                 topic, msg = subscriber.recv_multipart()
-                logging.info("[client] Received message %s|%s", topic, msg)
+                logging.debug("[client] Received message %s|%s", topic, msg)
                 if self.msg_queue.full():
                     val = self.msg_queue.get()
                     logging.warning("[client] Queue full. Throwing away '%s'", val)
@@ -196,7 +208,9 @@ class MultiClient:
             except queue.Empty:
                 pass
             except KeyError:
-                logging.warning("[client] Did not find '{}' in sockets".format(server_name))
+                logging.warning(
+                    "[client] Did not find '{}' in sockets".format(server_name)
+                )
 
         logging.info("[client] _command_thread closed")
 
@@ -262,8 +276,10 @@ class SingleClient(MultiClient):
         """
         self.__send__(self.SOCKETNAME, ns_socket, msg)
 
+    def ping(self, ns_socket: bytes = b""):
+        self.send(b"ping", ns_socket)
+
     def recv(self, timeout: float = None):
         _, topic, msg = self.__recv__(timeout=timeout)
         return [topic, msg]
-
 
