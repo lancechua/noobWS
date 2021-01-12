@@ -7,6 +7,7 @@ import multiprocessing
 import time
 
 import noobWS
+from noobWS.constants import Keyword
 
 logging.basicConfig(format="%(asctime)s|%(levelname)s: %(message)s", level=logging.INFO)
 
@@ -18,9 +19,11 @@ PORTS = {
     "single2": {"cmd": "tcp://127.0.0.1:50006", "pub": "tcp://127.0.0.1:50007"},
 }
 
-URIS = ["wss://echo.websocket.org/", "ws://demos.kaazing.com/echo"]
-
-KILL_SIGNAL = b"may you rest in a deep and dreamless slumber"
+URIS = [
+    "wss://echo.websocket.org/",
+    "wss://echo.websocket.org/",
+    #  "wss://demos.kaazing.com/echo",  # not working for some reason
+]
 
 
 def start_single(idx: int, name: bytes = b""):
@@ -28,13 +31,11 @@ def start_single(idx: int, name: bytes = b""):
     key = "single{:d}".format(idx + 1)
     ports = PORTS[key]
 
-    ss = noobWS.NoobServer(
-        URIS[idx], ports["cmd"], ports["pub"], name=name, kill_signal=KILL_SIGNAL
-    )
+    ss = noobWS.NoobServer(URIS[idx], ports["cmd"], ports["pub"], name=name)
 
     # changed to show source socket
-    ss.out_formatter = lambda msg, ns_socket: [
-        ns_socket,
+    ss.out_formatter = lambda msg, uri_name: [
+        uri_name,
         "{}: {}".format(key, msg).encode(),
     ]
     ss.run()
@@ -45,11 +46,7 @@ def start_multi(idx: int, name: bytes = b""):
     key = "multi{:d}".format(idx + 1)
     ports = PORTS[key]
     ms = noobWS.NoobServer(
-        dict(zip([b"echo1", b"echo2"], URIS)),
-        ports["cmd"],
-        ports["pub"],
-        name=name,
-        kill_signal=KILL_SIGNAL,
+        dict(zip([b"echo1", b"echo2"], URIS)), ports["cmd"], ports["pub"], name=name
     )
     ms.run()
 
@@ -75,14 +72,21 @@ def demo_sc_ss():
     sc.start()
 
     logging.info("SENDING>>> 'hello'")
-    sc.send("hello", ns_socket=sock_name)
-    logging.info(">>>RECEIVED [%s]: %s", *sc.recv())
+    sc.send("hello", uri_name=sock_name)
+    msg = sc.recv()
+    assert msg == [sock_name, b"single1: hello"], f"received {msg}"
+    logging.info(">>>RECEIVED [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> KILL_SIGNAL")
-    sc.send(KILL_SIGNAL)
-    logging.info(">>>RECEIVED [%s]: %s", *sc.recv())
+    sc.shutdown_server()
+    msg = sc.recv()
+    assert msg == [
+        Keyword.command.value,
+        f"single1: {Keyword.shutdown.value}".encode(),
+    ], f"received {msg}"
+    logging.info(">>>RECEIVED [%s]: %s", *msg)
 
     time.sleep(1)
 
@@ -110,20 +114,26 @@ def demo_sc_ms():
     sc.start()
 
     logging.info("SENDING>>> 'hello' to echo1")
-    sc.send("hello, echo1", ns_socket="echo1")
-    logging.info(">>>RECEIVED [%s]: %s", *sc.recv())
+    sc.send("hello, echo1", uri_name="echo1")
+    msg = sc.recv()
+    assert msg == [b"echo1", b"hello, echo1"], f"received {msg}"
+    logging.info(">>>RECEIVED [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> 'hello' to echo2")
-    sc.send("hello, echo2", ns_socket="echo2")
-    logging.info(">>>RECEIVED [%s]: %s", *sc.recv())
+    sc.send("hello, echo2", uri_name="echo2")
+    msg = sc.recv()
+    assert msg == [b"echo2", b"hello, echo2"], f"received {msg}"
+    logging.info(">>>RECEIVED [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> KILL_SIGNAL")
-    sc.send(KILL_SIGNAL)
-    logging.info(">>>RECEIVED [%s]: %s", *sc.recv())
+    sc.shutdown_server()
+    msg = sc.recv()
+    assert msg == [Keyword.command.value, Keyword.shutdown.value], f"received {msg}"
+    logging.info(">>>RECEIVED [%s]: %s", *msg)
 
     time.sleep(1)
 
@@ -154,23 +164,41 @@ def demo_mc_ss():
     mc.start()
 
     logging.info("SENDING>>> 'hello' to single1")
-    mc.send("socket1", "hello", ns_socket="single1")
-    logging.info(">>>RECEIVED %s, [%s]: %s", *mc.recv(None))
+    mc.send("socket1", "hello", uri_name="single1")
+    msg = mc.recv(None)
+    assert msg == [
+        "socket1",
+        b"single1",
+        b"single1: hello",
+    ], f"received {msg}"
+    logging.info(">>>RECEIVED %s, [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> 'hello' to single2")
     # since `socket2` is only has one external socket, it will default to the only socket
     mc.send("socket2", "hello")
-    logging.info(">>>RECEIVED %s, [%s]: %s", *mc.recv(None))
+    msg = mc.recv(None)
+    assert msg == [
+        "socket2",
+        b"single2",
+        b"single2: hello",
+    ], f"received {msg}"
+    logging.info(">>>RECEIVED %s, [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> KILL_SIGNAL to all sockets")
     for idx, socket_name in enumerate(mc.socket_dict):
-        socket_client = "socket{:d}".format(idx + 1)
-        mc.send(socket_client, KILL_SIGNAL, ns_socket=b"")
-        logging.info(">>>RECEIVED from %s, [%s]: %s", *mc.recv(None))
+        ns_name = "socket{:d}".format(idx + 1)
+        mc.shutdown_server(ns_name)
+        msg = mc.recv(None)
+        assert msg == [
+            ns_name,
+            Keyword.command.value,
+            f"single{idx + 1:d}: {Keyword.shutdown.value}".encode(),
+        ], f"received {msg}"
+        logging.info(">>>RECEIVED from %s, [%s]: %s", *msg)
 
     logging.info("Wait a few seconds before joining")
     time.sleep(5)
@@ -191,7 +219,7 @@ def demo_mc_ms():
 
     for idx in range(2):
         # internal name assigned to identify itself in published messages
-        socket_name = "doesnt_matter_for_multiclient{:d}".format(idx + 1).encode()
+        socket_name = "mc{:d}".format(idx + 1).encode()
         p = multiprocessing.Process(
             target=start_multi, args=(idx,), kwargs={"name": socket_name}, daemon=True
         )
@@ -207,34 +235,48 @@ def demo_mc_ms():
     mc.start()
 
     logging.info("SENDING>>> 'hello' to multi1.echo1")
-    mc.send("socket1", "hello to m1e1", ns_socket="echo1")
-    logging.info(">>>RECEIVED %s, [%s]: %s", *mc.recv(None))
+    mc.send("socket1", "hello to m1e1", uri_name="echo1")
+    msg = mc.recv(None)
+    assert msg == ["socket1", b"echo1", b"hello to m1e1"], f"received {msg}"
+    logging.info(">>>RECEIVED %s, [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> 'hello' to multi1.echo2")
-    mc.send("socket1", "hello to m1e2", ns_socket="echo2")
-    logging.info(">>>RECEIVED %s, [%s]: %s", *mc.recv(None))
+    mc.send("socket1", "hello to m1e2", uri_name="echo2")
+    msg = mc.recv(None)
+    assert msg == ["socket1", b"echo2", b"hello to m1e2"], f"received {msg}"
+    logging.info(">>>RECEIVED %s, [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> 'hello' to multi2.echo1")
-    mc.send("socket2", "hello to m2e1", ns_socket="echo1")
-    logging.info(">>>RECEIVED %s, [%s]: %s", *mc.recv(None))
+    mc.send("socket2", "hello to m2e1", uri_name="echo1")
+    msg = mc.recv(None)
+    assert msg == ["socket2", b"echo1", b"hello to m2e1"], f"received {msg}"
+    logging.info(">>>RECEIVED %s, [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> 'hello' to multi2.echo2")
-    mc.send("socket2", "hello to m2e2", ns_socket="echo2")
-    logging.info(">>>RECEIVED %s, [%s]: %s", *mc.recv(None))
+    mc.send("socket2", "hello to m2e2", uri_name="echo2")
+    msg = mc.recv(None)
+    assert msg == ["socket2", b"echo2", b"hello to m2e2"], f"received {msg}"
+    logging.info(">>>RECEIVED %s, [%s]: %s", *msg)
 
     time.sleep(1)
 
     logging.info("SENDING>>> KILL_SIGNAL to all sockets")
     for idx, socket_name in enumerate(mc.socket_dict):
-        socket_client = "socket{:d}".format(idx + 1)
-        mc.send(socket_client, KILL_SIGNAL, ns_socket=b"")
-        logging.info(">>>RECEIVED from %s, [%s]: %s", *mc.recv(None))
+        ns_name = "socket{:d}".format(idx + 1)
+        mc.shutdown_server(ns_name)
+        msg = mc.recv(None)
+        assert msg == [
+            ns_name,
+            Keyword.command.value,
+            Keyword.shutdown.value,
+        ], f"received {msg}"
+        logging.info(">>>RECEIVED from %s, [%s]: %s", *msg)
 
     logging.info("Wait a few seconds before joining")
     time.sleep(5)

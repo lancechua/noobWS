@@ -1,19 +1,23 @@
 """NoobClient Module"""
-
+from functools import wraps
 import logging
 import queue
 import threading
-from typing import List
+from typing import List, Union
 
 import zmq
 
+from .constants import Keyword
+
 
 class MultiClient:
-    """MultiClient - a client subscribed to multiple `NoobServer`'s
+    """MultiClient - a client subscribed to one or more `NoobServer`(s)
 
     Designed to work with a synchronous code.
 
-    Note: `ns` in parameters is supposed to stand for `NoobServer`
+    Notes
+    -----
+    `ns` in parameters is supposed to stand for `NoobServer`
     """
 
     def __init__(
@@ -33,7 +37,6 @@ class MultiClient:
         topics: list of bytes, optional
             list of topics to subscribe to; defaults to `[b""]`
             This will act as the default/fallback for topics if not specified
-
         qmaxsize: int, optional
             number of most recent messages stored; defaults to `50`
         timeout: float, optional
@@ -47,7 +50,7 @@ class MultiClient:
             value = Dict[str, str]
                 `{"cmd": cmd_address, "sub": sub_address, "topics": topic_list}`
                 "topics" is an optional key, used to specify topics at the socket level.
-                The value must be a list of bytes, defaults to the `topics` parameter.
+                The value must be a list of bytes, defaults to `topics` parameter value
 
         Notes
         ----------
@@ -79,47 +82,45 @@ class MultiClient:
         self.shutdown_event = threading.Event()
         self.threads = {}
 
-    def send(self, server_name: str, msg: bytes, ns_socket: bytes = b""):
+    def send(self, ns_name: str, msg: bytes, uri_name: bytes = b""):
         """Send message to socket
 
         Parameters
         ----------
-        server_name: str
-            internal server name as defined during initialization
+        ns_name: str
+            NoobServer name, as defined during initialization
         msg: bytes
-        ns_socket: bytes
-            `NoobServer` socket name
+        uri_name: bytes
+            destination URI in ns_name NoobServer
         """
-        self.__send__(server_name, ns_socket, msg)
+        self.cmd_queue.put(self.send_formatter(ns_name, uri_name, msg))
 
-    def __send__(self, server_name: str, ns_socket: bytes, msg: bytes):
-        """Internal method to send message"""
+    def send_formatter(self, ns_name: str, uri_name: bytes, msg: bytes):
+        """Format message before sending"""
+        try:
+            ns_name = ns_name.decode()
+        except AttributeError:
+            pass
 
-        if isinstance(server_name, bytes):
-            server_name = server_name.decode()
-
-        if isinstance(msg, str):
+        try:
             msg = msg.encode()
+        except AttributeError:
+            pass
 
-        if isinstance(ns_socket, str):
-            ns_socket = ns_socket.encode()
+        try:
+            uri_name = uri_name.encode()
+        except AttributeError:
+            pass
 
-        self.cmd_queue.put([server_name, ns_socket, msg])
-
-    def ping(self, server_name: str, ns_socket: bytes = b""):
-        self.send(server_name, b"ping", ns_socket=ns_socket)
+        return [ns_name, uri_name, msg]
 
     def recv(self, timeout: float = None):
         """Receive message to socket"""
-        return self.__recv__(timeout=timeout)
-
-    def __recv__(self, timeout: float = None):
-        """Internal method to receive message"""
         return self.msg_queue.get(timeout=timeout)
 
-    def _recv_formatter(self, msg, topic, ns_socket):
-        """Format incoming message"""
-        return [ns_socket, topic, msg]
+    def recv_formatter(self, msg: bytes, topic: bytes, uri_name: str):
+        """Format received message"""
+        return [uri_name, topic, msg]
 
     def start(self):
         """Start Client"""
@@ -139,7 +140,7 @@ class MultiClient:
                 target=self._subscriber_thread,
                 name="sub",
                 args=(sub_addr, self.socket_dict[sub_name].get("topics", self.topics)),
-                kwargs={"ns_socket": sub_name},
+                kwargs={"uri_name": sub_name},
                 daemon=True,
             )
 
@@ -164,7 +165,7 @@ class MultiClient:
         logging.info("[client] shutdown complete")
         self.running = False
 
-    def _subscriber_thread(self, address, topics, ns_socket: str = ""):
+    def _subscriber_thread(self, address, topics, uri_name: str = ""):
         subscriber = self.ctx.socket(self.pub_stype)
         subscriber.RCVTIMEO = int(self.timeout * 1000)
 
@@ -176,7 +177,7 @@ class MultiClient:
 
         logging.info(
             "[client] Subscribing to %s%s",
-            "{}@".format(ns_socket) if ns_socket else "",
+            "{}@".format(uri_name) if uri_name else "",
             address,
         )
         while not self.shutdown_event.is_set():
@@ -187,7 +188,7 @@ class MultiClient:
                     val = self.msg_queue.get()
                     logging.warning("[client] Queue full. Throwing away '%s'", val)
                 else:
-                    fmt_msg = self._recv_formatter(msg, topic, ns_socket=ns_socket)
+                    fmt_msg = self.recv_formatter(msg, topic, uri_name=uri_name)
                     self.msg_queue.put(fmt_msg)
             except zmq.Again:
                 pass
@@ -196,23 +197,36 @@ class MultiClient:
 
     def _command_thread(self, **kwargs):
         cmd_sockets = {}
-        for ns_socket, address in kwargs.items():
-            cmd_sockets[ns_socket] = self.ctx.socket(self.cmd_stype)
-            cmd_sockets[ns_socket].connect(address)
+        for ns_name, address in kwargs.items():
+            cmd_sockets[ns_name] = self.ctx.socket(self.cmd_stype)
+            cmd_sockets[ns_name].connect(address)
 
         logging.info("[client] Sending commands to: %s", kwargs)
         while not self.shutdown_event.is_set():
             try:
-                server_name, ns_socket, cmd = self.cmd_queue.get(timeout=self.timeout)
-                cmd_sockets[server_name].send_multipart([ns_socket, cmd])
+                ns_name, uri_name, cmd = self.cmd_queue.get(timeout=self.timeout)
+                cmd_sockets[ns_name].send_multipart([uri_name, cmd])
             except queue.Empty:
                 pass
             except KeyError:
-                logging.warning(
-                    "[client] Did not find '{}' in sockets".format(server_name)
-                )
+                logging.warning("[client] Did not find '{}' in sockets".format(ns_name))
 
         logging.info("[client] _command_thread closed")
+
+    # COMMANDS
+    def ping(self, ns_name: str):
+        """Send ping to NoobServer
+
+        Notes
+        -----
+        Expected reply: [Keyword.command.value, b"pong"]
+        Keyword defined in noobWS.constants
+        """
+        self.send(ns_name, Keyword.ping.value, Keyword.command.value)
+
+    def shutdown_server(self, ns_name: str):
+        """Send shutdown signal to NoobServer"""
+        self.send(ns_name, Keyword.shutdown.value, Keyword.command.value)
 
 
 class SingleClient(MultiClient):
@@ -262,24 +276,23 @@ class SingleClient(MultiClient):
             **{self.SOCKETNAME: {"cmd": cmd_addr, "pub": pub_addr}}
         )
 
-    def send(
-        self, msg: bytes or str, ns_socket: bytes or str = b""
-    ):  # pylint: disable=arguments-differ
+    def send(self, msg: bytes, uri_name: str = b""):  # pylint: disable=arguments-differ
         """Send message to socket
 
         Parameters
         ----------
         msg: bytes
             message to be sent
-        ns_socket: bytes, optional
-            socket name, if subscribed to a `MultiSocket`; defaults to `b""`
+        uri_name: bytes, optional, defaults to b""
+            socket name, required if NoobServer has multiple sockets
         """
-        self.__send__(self.SOCKETNAME, ns_socket, msg)
+        super().send(self.SOCKETNAME, msg, uri_name)
 
-    def ping(self, ns_socket: bytes = b""):
-        self.send(b"ping", ns_socket)
+    def shutdown_server(self):
+        self.send(Keyword.shutdown.value, Keyword.command.value)
 
-    def recv(self, timeout: float = None):
-        _, topic, msg = self.__recv__(timeout=timeout)
+    def ping(self):
+        self.send(Keyword.ping.value, Keyword.command.value)
+
+    def recv_formatter(self, msg: bytes, topic: bytes, uri_name: str):
         return [topic, msg]
-

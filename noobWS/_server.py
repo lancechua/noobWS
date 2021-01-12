@@ -8,6 +8,8 @@ import websockets
 import zmq
 from zmq.asyncio import Context
 
+from .constants import Keyword
+
 
 class NoobServer:
     """
@@ -15,14 +17,14 @@ class NoobServer:
 
     Has the following channels:
     * Websockets
-        * Internal websockets connected to one or more URIs provided
-        * If single socket, socket name = `self.name` attribute
-        * If multi socket, socket name = corresponding key in `uri` attribute
+        * Socket(s) connected to external URI(s)
+        * If single socket, socket name = `self.name`
+        * If multi socket, socket name = key in `uri` param
     * Command listener (zmq.PULL by default)
-        * listens to incoming messages, then sent to the appropriate websocket
-        * messages must be multipart, i.e. `[socket_name, message]`
-    * Message publisher (zmq.PUB  by default)
-        * publishes formatted messages received by the websocket
+        * listens to incoming messages; passed to the appropriate websocket
+        * messages must be multipart, i.e. `[uri_name, message]`
+    * Publisher (zmq.PUB  by default)
+        * publishes formatted messages received from the external websocket(s)
         * messages will be multipart, i.e. `[topic, message]`
 
     It is recommended to override the `in_formatter` and `out_formatter` methods
@@ -34,7 +36,6 @@ class NoobServer:
         uri: Dict[bytes, str] or str,
         cmd_addr: str,
         pub_addr: str,
-        kill_signal: bytes = None,
         name: bytes = None,
         cmd_stype: int = None,
         pub_stype: int = None,
@@ -54,8 +55,6 @@ class NoobServer:
             command listener address
         pub_addr: str
             message publisher address
-        kill_signal: bytes, optional
-            Triggers shutdown when received by command listener; defaults to `b"shutdown"`
         name : bytes, optional
             default socket name for single socket, defaults to `b""`
         cmd_stype, pub_stype: int
@@ -65,7 +64,10 @@ class NoobServer:
 
         self.name = name or b""
         if isinstance(self.name, str):
+            self._name_str = self.name
             self.name = self.name.encode()
+        else:
+            self._name_str = self.name.decode()
 
         if isinstance(uri, str):
             uri = {self.name: uri}
@@ -77,7 +79,6 @@ class NoobServer:
         self.uri = uri
         self.cmd_addr = cmd_addr
         self.pub_addr = pub_addr
-        self.kill_signal = kill_signal or b"shutdown"
         self.cmd_stype = cmd_stype or zmq.PULL  # pylint: disable=no-member
         self.pub_stype = pub_stype or zmq.PUB  # pylint: disable=no-member
 
@@ -91,88 +92,104 @@ class NoobServer:
         """
         Listener Coroutine
 
-        Handles incoming messages
+        Handles incoming messages from a NoobClient
 
         Notes
         ---------
         Messages should come in the following format:
-            `[socket_name: bytes, message: bytes]`
+            `[uri_name: bytes, message: bytes]`
 
-        `socket_name` should be valid; i.e. in `uri`
-        For the `kill_signal`, socket_name is still required, but is ignored.
+        `uri_name` should be valid; i.e. in `uri` or `Keyword.command.value`
         """
         receiver = self.ctx.socket(self.cmd_stype)  # pylint: disable=no-member
         receiver.bind(self.cmd_addr)
 
-        logging.info("[socket] Receiving messages on: %s", self.cmd_addr)
+        solo_ws = next(iter(self.ws.values())) if len(self.ws) == 1 else None
+
+        logging.info(
+            f"[NoobServer|{self._name_str}] Receiving NoobClient messages on: %s",
+            self.cmd_addr,
+        )
         while True:
             try:
-                socket_name, msg = await receiver.recv_multipart()
+                uri_name, msg = await receiver.recv_multipart()
             except ValueError:
                 logging.error(
                     "Invalid value received. "
-                    "Please make sure format is `[socket_name, msg]`"
+                    "Please make sure format is `[uri_name, msg]`"
                 )
                 continue
 
-            logging.info("[socket] LISTENER received %s|%s", socket_name, msg)
-            if msg == self.kill_signal:
-                logging.info("[socket] LISTENER received KILL signal")
-                break
-            elif msg == b"ping":
-                await self.msg_queue.put([socket_name, b"pong"])
+            logging.info(
+                f"[NoobServer|{self._name_str}] LISTENER received %s|%s",
+                uri_name,
+                msg,
+            )
+            if uri_name == Keyword.command.value:
+                if msg == Keyword.shutdown.value:
+                    logging.info(
+                        f"[NoobServer|{self._name_str}] LISTENER received KILL signal"
+                    )
+                    break
+                elif msg == Keyword.ping.value:
+                    await self.msg_queue.put([uri_name, Keyword.pong.value])
             else:
                 # formatter here
-                fmt_msg = self.in_formatter(msg, socket_name)
+                fmt_msg = self.in_formatter(msg, uri_name)
                 try:
-                    await self.ws[socket_name].send(fmt_msg)
+                    await self.ws[uri_name].send(fmt_msg)
                 except KeyError:
                     logging.warning(
-                        "[socket] '%s' is not in `self.ws`.keys(): %s",
-                        socket_name,
+                        f"[NoobServer|{self._name_str}] '%s' is not in provided uri(s): %s",
+                        uri_name,
                         self.ws.keys(),
                     )
                     if len(self.ws) == 1:
                         logging.warning(
-                            "[socket] Ignoring socket_name '%s', sending message to ONLY socket",
-                            socket_name,
+                            (
+                                f"[NoobServer|{self._name_str}] Ignoring uri_name '%s', "
+                                "sending message to ONLY socket"
+                            ),
+                            uri_name,
                         )
-                        await next(iter(self.ws.values())).send(fmt_msg)
+                        await solo_ws.send(fmt_msg)
 
         receiver.close()
-        logging.info("[socket] LISTENER closed")
+        logging.info(f"[NoobServer|{self._name_str}] LISTENER closed")
         await self.shutdown(False)
 
     async def data_feed(
-        self, ws: websockets.WebSocketClientProtocol, socket_name: bytes = b""
+        self, ws: websockets.WebSocketClientProtocol, uri_name: bytes = b""
     ):
         """
         Websocket Coroutine
 
-        Handles the connection to websockets as defined in `uri`
+        Handles the connection to external websockets
 
         Parameters
         ----------
         ws: websockets.WebSocketClientProtocol
-        socket_name: bytes, optional
-            will be supplied to data sent to publisher
+        uri_name: bytes, optional
+            will be supplied to data sent to NoobServer publisher
 
         Notes
         ----------
         Messages received are passed to the publisher with the following format:
-            `[socket_name: bytes, message: bytes]`
+            `[uri_name: bytes, message: bytes]`
         """
-        log_prefix = "{}| ".format(socket_name) if socket_name else ""
+        log_prefix = "{}| ".format(uri_name.decode()) if uri_name else ""
         error_caught = False
         try:
             async for msg in ws:
-                logging.debug("[client] %sReceived %s", log_prefix, msg)
-                await self.msg_queue.put([socket_name, msg])
+                logging.debug(
+                    f"[NoobServer|{self._name_str}] %sReceived %s", log_prefix, msg
+                )
+                await self.msg_queue.put([uri_name, msg])
         except websockets.ConnectionClosedError:
             logging.error("websocket closed unexpectedly %s", ws.remote_address)
             error_caught = True
-        except Exception:
-            logging.error("websocket error: %s", repr(Exception))
+        except Exception as err:
+            logging.error("websocket error: %s", repr(err))
             error_caught = True
         finally:
             if error_caught:
@@ -182,38 +199,53 @@ class NoobServer:
         """
         Publisher Coroutine
 
-        Processes messages from `data_feed` coroutines and publishes it
+        Processes messages from `data_feed` coroutine(s) and publishes for NoobClients
         """
         broadcaster = self.ctx.socket(self.pub_stype)  # pylint: disable=no-member
         broadcaster.setsockopt(zmq.LINGER, 3000)
         broadcaster.bind(self.pub_addr)
 
-        logging.info("[socket] Publishing messages on: %s", self.pub_addr)
+        logging.info(
+            f"[NoobServer|{self._name_str}] Publishing messages on: %s",
+            self.pub_addr,
+        )
         while True:
-            socket_name, msg = await self.msg_queue.get()
-            topic, fmt_msg = self.out_formatter(msg, socket_name)
-            logging.debug("[socket] PUBLISHER sending %s|%s", topic, fmt_msg)
+            uri_name, msg = await self.msg_queue.get()
+            topic, fmt_msg = self.out_formatter(msg, uri_name)
+            logging.debug(
+                f"[NoobServer|{self._name_str}] PUBLISHER sending %s|%s",
+                topic,
+                fmt_msg,
+            )
             await broadcaster.send_multipart([topic, fmt_msg])
 
-            if msg == self.kill_signal:
+            if (uri_name == Keyword.command.value) and (msg == Keyword.shutdown.value):
                 break
 
         broadcaster.close()
-        logging.info("[socket] PUBLISHER closed")
+        logging.info(f"[NoobServer|{self._name_str}] PUBLISHER closed")
 
-    async def shutdown(self, internal):
-        """Shutdown Coroutine"""
-        logging.warning("[socket] shutdown initiated")
+    async def shutdown(self, internal: bool):
+        """Shutdown Coroutine
+
+        Parameters
+        ----------
+        internal: bool
+            flag if shutdown triggered internally; (e.g. due to internal error)
+        """
+        logging.warning(f"[NoobServer|{self._name_str}] shutdown initiated")
 
         # close listener
         if internal:
             grim_reaper = self.ctx.socket(zmq.PUSH)  # pylint: disable=no-member
             grim_reaper.connect(self.cmd_addr)
-            await grim_reaper.send_multipart([b"__internal__", self.kill_signal])
+            await grim_reaper.send_multipart(
+                [Keyword.command.value, Keyword.shutdown.value]
+            )
             grim_reaper.close()
 
         # close publisher
-        await self.msg_queue.put([self.name, self.kill_signal])
+        await self.msg_queue.put([Keyword.command.value, Keyword.shutdown.value])
 
         # close sockets
         logging.info("Closing socket(s). This might take ~10 seconds...")
@@ -232,7 +264,7 @@ class NoobServer:
 
         addl_coros = addl_coros or []
 
-        logging.info("[socket] Starting")
+        logging.info(f"[NoobServer|{self._name_str}] Starting")
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
@@ -247,30 +279,31 @@ class NoobServer:
             + addl_coros
         )
 
-        logging.info("[socket] starting tasks")
+        logging.info(f"[NoobServer|{self._name_str}] starting tasks")
         try:
             self.connected = True
             self.loop.run_until_complete(asyncio.gather(*coros))
         except KeyboardInterrupt:
-            logging.warning("[socket] KeyboardInterrupt caught!")
+            logging.warning(f"[NoobServer|{self._name_str}] KeyboardInterrupt caught!")
             self.loop.run_until_complete(self.shutdown(True))
         finally:
             self.ctx.term()
             self.loop.close()
 
-        logging.info("[socket] Closed.")
+        logging.info(f"[NoobServer|{self._name_str}] Closed.")
 
     def restart(self, addl_coros: list = None):
+        """Restart NoobServer; calls `shutdown` first, then `run`"""
         self.loop.run_until_complete(self.shutdown(True))
         self.run(addl_coros=addl_coros)
 
-    def in_formatter(self, msg: bytes, socket_name: bytes = b""):
+    def in_formatter(self, msg: bytes, uri_name: bytes = b""):
         """Formatter for incoming messages
 
         Parameters
         ----------
         msg: bytes
-        socket_name: bytes, optional
+        uri_name: bytes, optional
             defaults to `b""`
 
         Returns
@@ -281,18 +314,17 @@ class NoobServer:
         Notes
         ----------
         Only formats the `msg` part of the multi-part message received by the listener.
-        The `socket_name` part of the message will always be required,
-        as it is used to identify sockets.
+        `uri_name` is always required since it identifies the destination URI.
         """
         return msg.decode()
 
-    def out_formatter(self, msg, socket_name: bytes = b""):
+    def out_formatter(self, msg, uri_name: bytes = b""):
         """Formatter for outgoing multi-part messages
 
         Parameters
         ----------
         msg: bytes
-        socket_name: bytes, optional
+        uri_name: bytes, optional
             used as the topic; defaults to `b""`
 
         Returns
@@ -305,4 +337,4 @@ class NoobServer:
         except AttributeError:
             fmsg = msg
 
-        return [socket_name, fmsg]
+        return [uri_name, fmsg]
